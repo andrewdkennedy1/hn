@@ -39,6 +39,9 @@ struct Item {
     /// Optional number of comments on the story
     #[serde(default)]
     descendants: Option<u32>,
+    /// Optional story text content (for Show HN posts)
+    #[serde(default)]
+    text: Option<String>,
 }
 
 /// Application state enum to handle different screens
@@ -46,6 +49,7 @@ struct Item {
 enum AppState {
     Loading,
     Stories,
+    ShowHN, // Show HN posts only
     Error(String),
 }
 
@@ -54,12 +58,18 @@ enum AppState {
 struct App {
     /// List of stories to display
     stories: Vec<Item>,
+    /// List of Show HN stories
+    show_stories: Vec<Item>,
     /// Index of the currently selected story
     selected: usize,
+    /// Index of the currently selected Show HN story
+    show_selected: usize,
     /// Current application state
     state: AppState,
     /// Loading progress (0-100)
     loading_progress: u16,
+    /// Whether to show detailed info (score, author, comments, time)
+    show_info: bool,
 }
 
 // ===== APP IMPLEMENTATION =====
@@ -69,29 +79,80 @@ impl App {
     fn new() -> Self {
         Self {
             stories: Vec::new(),
+            show_stories: Vec::new(),
             selected: 0,
+            show_selected: 0,
             state: AppState::Loading,
             loading_progress: 0,
+            show_info: false, // Default to off
         }
+    }
+
+    /// Toggles the info display
+    fn toggle_info(&mut self) {
+        self.show_info = !self.show_info;
+    }
+
+    /// Switches to Show HN view
+    fn switch_to_show_hn(&mut self) {
+        self.state = AppState::ShowHN;
+    }
+
+    /// Returns to the stories list
+    fn back_to_stories(&mut self) {
+        self.state = AppState::Stories;
+    }
+
+    /// Sets the Show HN stories
+    fn set_show_stories(&mut self, stories: Vec<Item>) {
+        self.show_stories = stories;
+        self.show_selected = 0;
     }
 
     /// Moves selection to the next story if available
     fn next(&mut self) {
-        if !self.stories.is_empty() && self.selected < self.stories.len().saturating_sub(1) {
-            self.selected += 1;
+        match self.state {
+            AppState::Stories => {
+                if !self.stories.is_empty() && self.selected < self.stories.len().saturating_sub(1)
+                {
+                    self.selected += 1;
+                }
+            }
+            AppState::ShowHN => {
+                if !self.show_stories.is_empty()
+                    && self.show_selected < self.show_stories.len().saturating_sub(1)
+                {
+                    self.show_selected += 1;
+                }
+            }
+            _ => {}
         }
     }
 
     /// Moves selection to the previous story if available
     fn previous(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        match self.state {
+            AppState::Stories => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+            }
+            AppState::ShowHN => {
+                if self.show_selected > 0 {
+                    self.show_selected -= 1;
+                }
+            }
+            _ => {}
         }
     }
 
     /// Returns a reference to the currently selected story
     fn selected_story(&self) -> Option<&Item> {
-        self.stories.get(self.selected)
+        match self.state {
+            AppState::Stories => self.stories.get(self.selected),
+            AppState::ShowHN => self.show_stories.get(self.show_selected),
+            _ => None,
+        }
     }
 
     /// Sets the stories and transitions to Stories state
@@ -117,6 +178,16 @@ impl App {
 /// Fetches the top story IDs from Hacker News API
 async fn fetch_top_story_ids(client: &Client) -> Result<Vec<u64>> {
     let url = "https://hacker-news.firebaseio.com/v0/topstories.json";
+
+    let response = client.get(url).send().await?;
+    let ids: Vec<u64> = response.json().await?;
+
+    Ok(ids.into_iter().take(30).collect())
+}
+
+/// Fetches the Show HN story IDs from Hacker News API
+async fn fetch_show_story_ids(client: &Client) -> Result<Vec<u64>> {
+    let url = "https://hacker-news.firebaseio.com/v0/showstories.json";
 
     let response = client.get(url).send().await?;
     let ids: Vec<u64> = response.json().await?;
@@ -164,6 +235,36 @@ where
     Ok(stories)
 }
 
+/// Fetches the top 30 Show HN stories from Hacker News with progress updates
+async fn fetch_show_stories_with_progress<F>(progress_callback: F) -> Result<Vec<Item>>
+where
+    F: Fn(u16),
+{
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+    progress_callback(10);
+
+    let ids = fetch_show_story_ids(&client).await?;
+    progress_callback(20);
+
+    let mut stories = Vec::new();
+    let total_ids = ids.len() as f32;
+
+    for (index, id) in ids.iter().enumerate() {
+        match fetch_item(&client, *id).await {
+            Ok(item) => stories.push(item),
+            Err(e) => eprintln!("Failed to fetch item {}: {}", id, e),
+        }
+
+        // Update progress (20% to 90% for fetching items)
+        let progress = 20 + ((index as f32 / total_ids) * 70.0) as u16;
+        progress_callback(progress);
+    }
+
+    progress_callback(100);
+    Ok(stories)
+}
+
 // ===== UI FUNCTIONS =====
 
 /// Renders the user interface for the Hacker News application
@@ -171,6 +272,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     match &app.state {
         AppState::Loading => render_loading_screen(f, app),
         AppState::Stories => render_stories_screen(f, app),
+        AppState::ShowHN => render_show_hn_screen(f, app),
         AppState::Error(error) => render_error_screen(f, error),
     }
 }
@@ -351,7 +453,7 @@ fn render_stories_screen(f: &mut Frame, app: &mut App) {
                 };
 
                 // Create aligned content with proper spacing
-                let content = vec![
+                let mut content = vec![
                     // Empty line for spacing
                     Line::from(""),
                     // Title line with rank number
@@ -375,8 +477,11 @@ fn render_stories_screen(f: &mut Frame, app: &mut App) {
                                 .add_modifier(Modifier::ITALIC),
                         ),
                     ]),
-                    // Stats line with consistent spacing and alignment
-                    Line::from(vec![
+                ];
+
+                // Conditionally add stats line if info is enabled
+                if app.show_info {
+                    content.push(Line::from(vec![
                         Span::styled("    ", Style::default()), // Indent to align with title
                         Span::styled(
                             format!("▲ {:3}", story.score),
@@ -399,10 +504,11 @@ fn render_stories_screen(f: &mut Frame, app: &mut App) {
                             format!("🕒 {}", time_str),
                             Style::default().fg(Color::Yellow),
                         ),
-                    ]),
-                    // Empty line for spacing
-                    Line::from(""),
-                ];
+                    ]));
+                }
+
+                // Empty line for spacing
+                content.push(Line::from(""));
                 ListItem::new(content).style(Style::default())
             })
             .collect();
@@ -439,7 +545,224 @@ fn render_stories_screen(f: &mut Frame, app: &mut App) {
     }
 
     // Render footer with instructions
-    let footer_text = "↑↓ Navigate • Enter Open Link • R Refresh • Q Quit";
+    let info_status = if app.show_info { "ON" } else { "OFF" };
+    let footer_text = format!(
+        "↑↓ Navigate • Enter Open Link • I Info ({}) • S Show HN • R Refresh • Q Quit",
+        info_status
+    );
+    let footer = Paragraph::new(footer_text)
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray))
+                .title("Controls")
+                .title_style(
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+    f.render_widget(footer, chunks[2]);
+}
+
+/// Renders the Show HN screen
+fn render_show_hn_screen(f: &mut Frame, app: &mut App) {
+    // Split the screen into header, stories, and footer sections
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Stories list
+            Constraint::Length(3), // Footer
+        ])
+        .split(f.area());
+
+    // Render the header with Show HN styling
+    let title = Paragraph::new("🚀 Show HN")
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title_style(
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+    f.render_widget(title, chunks[0]);
+
+    if app.show_stories.is_empty() {
+        let empty_msg = Paragraph::new("No Show HN stories available")
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::White))
+                    .title("Show HN Stories"),
+            );
+        f.render_widget(empty_msg, chunks[1]);
+    } else {
+        // Create list items for each Show HN story
+        let items: Vec<ListItem> = app
+            .show_stories
+            .iter()
+            .enumerate()
+            .map(|(index, story)| {
+                // Format the URL display
+                let url_display = if let Some(url) = &story.url {
+                    if !url.is_empty() {
+                        let domain = url.split('/').nth(2).unwrap_or("unknown");
+                        format!(" ({})", domain)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Format time
+                let time_str = {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let diff = now.saturating_sub(story.time);
+                    if diff < 3600 {
+                        format!("{}m", diff / 60)
+                    } else if diff < 86400 {
+                        format!("{}h", diff / 3600)
+                    } else {
+                        format!("{}d", diff / 86400)
+                    }
+                };
+
+                // Create aligned content with proper spacing
+                let mut content = vec![
+                    // Empty line for spacing
+                    Line::from(""),
+                    // Title line with rank number and Show HN indicator
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{:2}. ", index + 1),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "Show HN: ",
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            story
+                                .title
+                                .strip_prefix("Show HN: ")
+                                .unwrap_or(&story.title),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            url_display,
+                            Style::default()
+                                .fg(Color::Blue)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]),
+                ];
+
+                // Conditionally add stats line if info is enabled
+                if app.show_info {
+                    content.push(Line::from(vec![
+                        Span::styled("    ", Style::default()), // Indent to align with title
+                        Span::styled(
+                            format!("▲ {:3}", story.score),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("👤 {}", story.by),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("💬 {:2}", story.descendants.unwrap_or(0)),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("🕒 {}", time_str),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                }
+
+                // Empty line for spacing
+                content.push(Line::from(""));
+                ListItem::new(content).style(Style::default())
+            })
+            .collect();
+
+        // Render the Show HN stories list
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Magenta))
+                    .title(format!(
+                        "🚀 Show HN ({}/{})",
+                        app.show_selected + 1,
+                        app.show_stories.len()
+                    ))
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Magenta)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("➤ ");
+
+        let mut state = ListState::default();
+        state.select(Some(app.show_selected));
+
+        f.render_stateful_widget(list, chunks[1], &mut state);
+    }
+
+    // Render footer with Show HN specific instructions
+    let info_status = if app.show_info { "ON" } else { "OFF" };
+    let footer_text = format!(
+        "↑↓ Navigate • Enter Open Link • I Info ({}) • S Stories • R Refresh • Q Quit",
+        info_status
+    );
     let footer = Paragraph::new(footer_text)
         .style(
             Style::default()
@@ -494,6 +817,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result
                 }
                 AppMessage::StoriesLoaded(stories) => {
                     app.set_stories(stories);
+                }
+                AppMessage::ShowStoriesLoaded(stories) => {
+                    app.set_show_stories(stories);
                 }
                 AppMessage::Error(error) => {
                     app.set_error(error);
@@ -568,6 +894,33 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result
                                     }
                                 }
                             }
+                            KeyCode::Char('i') | KeyCode::Char('I') => {
+                                // Toggle info display
+                                app.toggle_info();
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                // Switch to Show HN view and load stories if needed
+                                app.switch_to_show_hn();
+                                if app.show_stories.is_empty() {
+                                    let tx_clone = tx.clone();
+                                    tokio::spawn(async move {
+                                        match fetch_show_stories_with_progress(|progress| {
+                                            let _ = tx_clone.send(AppMessage::Progress(progress));
+                                        })
+                                        .await
+                                        {
+                                            Ok(stories) => {
+                                                let _ = tx_clone
+                                                    .send(AppMessage::ShowStoriesLoaded(stories));
+                                            }
+                                            Err(e) => {
+                                                let _ =
+                                                    tx_clone.send(AppMessage::Error(e.to_string()));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 // Refresh stories
                                 app.state = AppState::Loading;
@@ -593,6 +946,58 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result
                             _ => {}
                         }
                     }
+                    AppState::ShowHN => {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                                return Ok(());
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.next();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.previous();
+                            }
+                            KeyCode::Enter => {
+                                // Open URL in browser
+                                if let Some(story) = app.selected_story() {
+                                    if let Some(url) = &story.url {
+                                        if !url.is_empty() {
+                                            let _ = open::that(url);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('i') | KeyCode::Char('I') => {
+                                // Toggle info display
+                                app.toggle_info();
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                // Switch back to regular stories
+                                app.back_to_stories();
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                // Refresh Show HN stories
+                                app.show_stories.clear();
+                                let tx_clone = tx.clone();
+                                tokio::spawn(async move {
+                                    match fetch_show_stories_with_progress(|progress| {
+                                        let _ = tx_clone.send(AppMessage::Progress(progress));
+                                    })
+                                    .await
+                                    {
+                                        Ok(stories) => {
+                                            let _ = tx_clone
+                                                .send(AppMessage::ShowStoriesLoaded(stories));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx_clone.send(AppMessage::Error(e.to_string()));
+                                        }
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -604,6 +1009,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result
 enum AppMessage {
     Progress(u16),
     StoriesLoaded(Vec<Item>),
+    ShowStoriesLoaded(Vec<Item>),
     Error(String),
 }
 
